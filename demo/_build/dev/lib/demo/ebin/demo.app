@@ -1,0 +1,1 @@
+{application,demo,[{modules,['Elixir.Demo','Elixir.Demo.Application','Elixir.Demo.Catalog','Elixir.Demo.Domain','Elixir.Demo.Event','Elixir.Inspect.Demo.Event']},{optional_applications,[]},{applications,[kernel,stdlib,elixir,logger,ash_iceberg,benchee,jason]},{description,[100,101,109,111]},{registered,[]},{vsn,[48,46,49,46,48]},{mod,{'Elixir.Demo.Application',[]}}]}.

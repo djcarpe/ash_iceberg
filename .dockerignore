@@ -1,0 +1,6 @@
+_build/
+deps/
+demo/_build/
+demo/deps/
+.git/
+*.md

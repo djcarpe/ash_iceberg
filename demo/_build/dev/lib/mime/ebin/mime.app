@@ -1,0 +1,1 @@
+{application,mime,[{modules,['Elixir.MIME']},{compile_env,[{mime,[extensions],error},{mime,[suffixes],error},{mime,[types],error}]},{optional_applications,[]},{applications,[kernel,stdlib,elixir,logger]},{description,[65,32,77,73,77,69,32,116,121,112,101,32,109,111,100,117,108,101,32,102,111,114,32,69,108,105,120,105,114]},{registered,[]},{vsn,[50,46,48,46,55]},{env,[]}]}.

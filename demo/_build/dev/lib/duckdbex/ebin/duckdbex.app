@@ -1,0 +1,1 @@
+{application,duckdbex,[{modules,['Elixir.Duckdbex','Elixir.Duckdbex.NIF']},{optional_applications,[]},{applications,[kernel,stdlib,elixir,logger,public_key]},{description,[65,110,32,69,108,105,120,105,114,32,68,117,99,107,68,66,32,108,105,98,114,97,114,121]},{registered,[]},{vsn,[48,46,52,46,49]}]}.
