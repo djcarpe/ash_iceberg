@@ -24,18 +24,27 @@ defmodule AshIceberg.Catalog.RestClient do
     end
   end
 
-  @doc "Create a new Iceberg table."
-  @spec create_table(map(), String.t(), String.t(), map()) ::
+  @doc """
+  Create a new Iceberg table.
+
+  `partition_spec` is optional; when `nil` or omitted the table is unpartitioned.
+  """
+  @spec create_table(map(), String.t(), String.t(), map(), map() | nil) ::
           {:ok, map()} | {:error, term()}
-  def create_table(config, namespace, table, schema) do
-    body = %{
-      "name" => table,
-      "schema" => schema,
-      "write-order" => %{"order-id" => 0, "fields" => []}
-    }
+  def create_table(config, namespace, table, schema, partition_spec \\ nil) do
+    body =
+      %{
+        "name" => table,
+        "schema" => schema,
+        "write-order" => %{"order-id" => 0, "fields" => []}
+      }
+      |> maybe_put("partition-spec", partition_spec)
 
     post(config, "/v1/namespaces/#{encode_namespace(namespace)}/tables", body)
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   @doc """
   Commit a set of metadata updates to an existing table (e.g. append snapshot).
@@ -71,6 +80,135 @@ defmodule AshIceberg.Catalog.RestClient do
       {:error, {409, _}} -> :ok
       {:error, _} = err -> err
     end
+  end
+
+  @doc """
+  Load the full raw table metadata document from the REST catalog.
+
+  Returns the parsed JSON body (includes `metadata-location`, `metadata`,
+  `config`, etc.).
+  """
+  @spec load_table_metadata(map(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def load_table_metadata(config, namespace, table) do
+    load_table(config, namespace, table)
+  end
+
+  @doc """
+  List snapshots for a table by reading its metadata from the REST catalog.
+
+  Returns a list of snapshot maps in chronological order (oldest first).
+  Each map contains at minimum:
+  - `"snapshot-id"` — unique integer ID
+  - `"timestamp-ms"` — Unix milliseconds
+  - `"operation"` — `"append"`, `"overwrite"`, `"replace"`, or `"delete"`
+  - `"summary"` — map of arbitrary metadata
+  """
+  @spec list_snapshots(map(), String.t(), String.t()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_snapshots(config, namespace, table) do
+    case load_table(config, namespace, table) do
+      {:ok, %{"metadata" => %{"snapshots" => snapshots}}} ->
+        ordered = Enum.sort_by(snapshots, & &1["timestamp-ms"])
+        {:ok, ordered}
+
+      {:ok, _other} ->
+        {:ok, []}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
+  Apply one or more schema updates to an existing table via the REST commit API.
+
+  `updates` is a list of Iceberg table update maps.  Common shapes:
+
+  **Add a column**
+
+      %{
+        "action" => "add-column",
+        "parent" => nil,                    # nil for top-level
+        "name" => "new_col",
+        "type" => "string",
+        "doc" => "optional docstring",
+        "required" => false
+      }
+
+  **Remove a column** (by field-id or name)
+
+      %{"action" => "remove-field", "path" => ["column_name"]}
+
+  **Rename a column**
+
+      %{"action" => "rename-field", "path" => ["old_name"], "new-name" => "new_name"}
+
+  **Update nullability**
+
+      %{"action" => "make-column-optional", "path" => ["column_name"]}
+
+  Returns `{:ok, response_map}` on success.
+  """
+  @spec evolve_schema(map(), String.t(), String.t(), [map()]) ::
+          {:ok, map()} | {:error, term()}
+  def evolve_schema(config, namespace, table, updates) when is_list(updates) do
+    schema_updates = Enum.map(updates, fn u -> Map.put_new(u, "action-type", "update-schema") end)
+    commit_table(config, namespace, table, [], schema_updates)
+  end
+
+  @doc """
+  Expire snapshots via the REST catalog.
+
+  Accepts either a `DateTime` (legacy positional form) or a keyword list:
+    - `:older_than` — expire snapshots committed before this `DateTime`
+    - `:min_snapshots_to_keep` — always keep at least this many recent snapshots
+
+  Not all catalog implementations support this endpoint; returns
+  `{:error, {404, _}}` when unsupported.
+  """
+  @spec expire_snapshots(map(), String.t(), String.t(), DateTime.t() | keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def expire_snapshots(config, namespace, table, %DateTime{} = older_than) do
+    expire_snapshots(config, namespace, table, older_than: older_than)
+  end
+
+  def expire_snapshots(config, namespace, table, opts) when is_list(opts) do
+    body =
+      %{}
+      |> then(fn b ->
+        case opts[:older_than] do
+          %DateTime{} = dt -> Map.put(b, "older-than-ms", DateTime.to_unix(dt, :millisecond))
+          nil -> b
+        end
+      end)
+      |> then(fn b ->
+        case opts[:min_snapshots_to_keep] do
+          n when is_integer(n) -> Map.put(b, "min-snapshots-to-keep", n)
+          nil -> b
+        end
+      end)
+
+    post(config, "/v1/namespaces/#{encode_namespace(namespace)}/tables/#{table}/snapshots/expire", body)
+  end
+
+  @doc """
+  Update table properties (arbitrary key-value pairs stored in table metadata).
+
+      RestClient.set_table_properties(cfg, "analytics", "events",
+        %{"write.target-file-size-bytes" => "134217728"}
+      )
+  """
+  @spec set_table_properties(map(), String.t(), String.t(), map()) ::
+          {:ok, map()} | {:error, term()}
+  def set_table_properties(config, namespace, table, properties) when is_map(properties) do
+    update = %{
+      "action" => "set-properties",
+      "action-type" => "update-properties",
+      "updates" => properties
+    }
+
+    commit_table(config, namespace, table, [], [update])
   end
 
   @doc "List all namespaces (optionally nested under a parent)."

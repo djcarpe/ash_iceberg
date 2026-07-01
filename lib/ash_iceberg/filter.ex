@@ -108,10 +108,26 @@ defmodule AshIceberg.Filter do
     end
   end
 
-  # Substring (LIKE)
+  # Contains (substring LIKE)
   defp expr_to_sql(%Ash.Query.Function.Contains{arguments: [left, right]}) do
     with {:ok, l} <- ref_or_value(left) do
-      term = format_like_string(right)
+      term = format_like_string(right, :contains)
+      {:ok, "#{l} LIKE #{term}"}
+    end
+  end
+
+  # StartsWith (prefix LIKE)
+  defp expr_to_sql(%Ash.Query.Function.StringStartsWith{arguments: [left, right]}) do
+    with {:ok, l} <- ref_or_value(left) do
+      term = format_like_string(right, :starts_with)
+      {:ok, "#{l} LIKE #{term}"}
+    end
+  end
+
+  # EndsWith (suffix LIKE)
+  defp expr_to_sql(%Ash.Query.Function.StringEndsWith{arguments: [left, right]}) do
+    with {:ok, l} <- ref_or_value(left) do
+      term = format_like_string(right, :ends_with)
       {:ok, "#{l} LIKE #{term}"}
     end
   end
@@ -151,12 +167,18 @@ defmodule AshIceberg.Filter do
 
   defp format_value(value), do: "'#{escape_string(inspect(value))}'"
 
-  defp format_like_string(value) when is_binary(value) do
+  defp format_like_string(value, mode) when is_binary(value) do
     escaped = String.replace(value, "'", "''")
-    "'%#{escaped}%'"
+
+    case mode do
+      :contains -> "'%#{escaped}%'"
+      :starts_with -> "'#{escaped}%'"
+      :ends_with -> "'%#{escaped}'"
+    end
   end
 
-  defp format_like_string(%Ash.Query.Ref{attribute: %{name: name}}), do: quote_ident(to_string(name))
+  defp format_like_string(%Ash.Query.Ref{attribute: %{name: name}}, _mode),
+    do: quote_ident(to_string(name))
 
   defp escape_string(s) do
     s

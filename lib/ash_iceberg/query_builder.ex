@@ -109,10 +109,11 @@ defmodule AshIceberg.QueryBuilder do
   # ---------------------------------------------------------------------------
 
   # FROM clause — iceberg_scan() for warehouse mode, qualified name for catalog
-  defp build_from(%Query{catalog: nil, warehouse: warehouse, namespace: ns, table: tbl})
+  defp build_from(%Query{catalog: nil, warehouse: warehouse, namespace: ns, table: tbl} = query)
        when is_binary(warehouse) do
     path = table_path(warehouse, ns, tbl)
-    {:ok, "iceberg_scan('#{path}')"}
+    scan_args = build_scan_args(query)
+    {:ok, "iceberg_scan('#{path}'#{scan_args})"}
   end
 
   defp build_from(%Query{catalog: catalog, namespace: ns, table: tbl}) when not is_nil(catalog) do
@@ -122,11 +123,10 @@ defmodule AshIceberg.QueryBuilder do
 
   defp build_from(_), do: {:error, "No catalog or warehouse configured on query"}
 
-  # INTO clause (same as FROM but without iceberg_scan wrapping for DML)
+  # INTO clause (same as FROM but without time-travel; DML always targets current snapshot)
   defp build_into(%Query{catalog: nil, warehouse: warehouse, namespace: ns, table: tbl})
        when is_binary(warehouse) do
     path = table_path(warehouse, ns, tbl)
-    # DuckDB supports DML on `iceberg_scan()` in newer versions; fall back to path
     {:ok, "iceberg_scan('#{path}')"}
   end
 
@@ -137,6 +137,18 @@ defmodule AshIceberg.QueryBuilder do
 
   defp build_into(_), do: {:error, "No catalog or warehouse configured on query"}
 
+  # Time-travel args for iceberg_scan()
+  defp build_scan_args(%Query{snapshot_id: id}) when is_integer(id) do
+    ", snapshot_id = #{id}"
+  end
+
+  defp build_scan_args(%Query{as_of: %DateTime{} = dt}) do
+    ms = DateTime.to_unix(dt, :millisecond)
+    ", snapshot_timestamp_ms = #{ms}"
+  end
+
+  defp build_scan_args(_), do: ""
+
   defp table_path(warehouse, namespace, table) do
     warehouse = String.trim_trailing(warehouse, "/")
     "#{warehouse}/#{namespace}/#{table}"
@@ -146,24 +158,16 @@ defmodule AshIceberg.QueryBuilder do
     {:ok, "*"}
   end
 
-  defp build_select_clause(%Query{select: [], aggregates: aggs}) when aggs != [] do
-    cols =
-      Enum.map(aggs, fn agg ->
-        build_aggregate_sql(agg)
-      end)
-
-    {:ok, Enum.join(cols, ", ")}
+  defp build_select_clause(%Query{aggregates: aggs}) when aggs != [] do
+    # When aggregates are present, select ONLY the aggregate expressions.
+    # Mixing non-grouped columns with aggregate functions is invalid SQL without GROUP BY.
+    cols = Enum.map_join(aggs, ", ", &build_aggregate_sql/1)
+    {:ok, cols}
   end
 
   defp build_select_clause(%Query{select: fields, aggregates: []}) do
     cols = Enum.map_join(fields, ", ", &~s("#{&1}"))
     {:ok, cols}
-  end
-
-  defp build_select_clause(%Query{select: fields, aggregates: aggs}) do
-    base = Enum.map_join(fields, ", ", &~s("#{&1}"))
-    agg_sql = Enum.map_join(aggs, ", ", &build_aggregate_sql/1)
-    {:ok, "#{base}, #{agg_sql}"}
   end
 
   defp build_aggregate_sql(%Ash.Query.Aggregate{kind: :count, name: name}) do
@@ -227,7 +231,7 @@ defmodule AshIceberg.QueryBuilder do
     do: {:ok, "LIMIT #{limit}"}
 
   defp build_limit(%Query{limit: nil, offset: offset}) when is_integer(offset),
-    do: {:ok, "LIMIT 18446744073709551615 OFFSET #{offset}"}
+    do: {:ok, "LIMIT 9223372036854775807 OFFSET #{offset}"}
 
   defp build_limit(%Query{limit: limit, offset: offset}),
     do: {:ok, "LIMIT #{limit} OFFSET #{offset}"}

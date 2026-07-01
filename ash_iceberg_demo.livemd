@@ -1,0 +1,814 @@
+# AshIceberg: Apache Iceberg for Ash Resources
+
+```elixir
+Application.put_env(:ash, :validate_domain_resource_inclusion?, false)
+Application.put_env(:ash, :validate_domain_config_inclusion?, false)
+
+Mix.install(
+  [
+    {:ash_iceberg, path: "/data/"},
+    {:ash, "~> 3.0"},
+    {:req, "~> 0.5"},
+    {:jason, "~> 1.4"},
+    {:benchee, "~> 1.3"},
+    {:kino, "~> 0.14"}
+  ],
+  consolidate_protocols: false
+)
+```
+
+```elixir
+# ── Wait for Iceberg REST Catalog ─────────────────────────────────────────────
+catalog_uri = System.get_env("ICEBERG_REST_URI", "http://localhost:8181")
+IO.write("Waiting for catalog at #{catalog_uri}")
+
+Enum.reduce_while(1..60, nil, fn i, _ ->
+  case Req.get("#{catalog_uri}/v1/config") do
+    {:ok, %{status: 200}} -> {:halt, :ready}
+    _ ->
+      IO.write(".")
+      Process.sleep(2_000)
+      if i == 60, do: raise("catalog not reachable")
+      {:cont, nil}
+  end
+end)
+
+IO.puts(" ✓")
+
+# ── Catalog module ─────────────────────────────────────────────────────────────
+defmodule Demo.Catalog do
+  use AshIceberg.Catalog, otp_app: :demo
+
+  @impl AshIceberg.Catalog
+  def config do
+    %{
+      type: :rest,
+      catalog_name: "demo_catalog",
+      uri: System.get_env("ICEBERG_REST_URI", "http://localhost:8181"),
+      warehouse: System.get_env("S3_WAREHOUSE", "s3://warehouse/"),
+      aws_region: System.get_env("S3_REGION", "us-east-1"),
+      aws_access_key_id: System.get_env("S3_ACCESS_KEY", "minioadmin"),
+      aws_secret_access_key: System.get_env("S3_SECRET_KEY", "minioadmin"),
+      s3_endpoint: System.get_env("S3_ENDPOINT", "http://localhost:9000"),
+      s3_url_style: "path",
+      s3_use_ssl: false
+    }
+  end
+end
+
+{:ok, _} = Demo.Catalog.start_link()
+IO.puts("✓ DuckDB + iceberg extension started")
+```
+
+## What Is AshIceberg?
+
+`AshIceberg` is an Ash data layer that backs resources with [Apache Iceberg](https://iceberg.apache.org) tables. Queries execute through [DuckDB](https://duckdb.org) (via the `duckdbex` NIF), which reads Iceberg's Parquet data files directly from S3. The Iceberg REST Catalog tracks table metadata and commits.
+
+The result: an append-optimised, analytics-ready table format accessible through the same Ash API you use for PostgreSQL or any other resource. Every write becomes an immutable **snapshot**; the full snapshot history is queryable with a single context key.
+
+### How it fits together
+
+| Concern | Component |
+| --- | --- |
+| Schema, actions, policies | Ash resource DSL |
+| Query compilation | `AshIceberg.QueryBuilder` → SQL strings |
+| Query execution | DuckDB + iceberg extension via `Duckdbex` |
+| Data files | Parquet on S3 (MinIO in this demo) |
+| Table metadata | Iceberg REST Catalog (Tabular reference impl) |
+| Connection | `AshIceberg.Connection` GenServer (one per catalog) |
+| Time travel | `snapshot_id` / `as_of` in Ash query context |
+| Partition pruning | `partition` entities in the `iceberg` DSL block |
+
+## Infrastructure
+
+AshIceberg requires two external services:
+
+| Service | Role | This demo |
+| --- | --- | --- |
+| **Iceberg REST Catalog** | Table metadata, snapshot commits | `tabulario/iceberg-rest` |
+| **S3 / compatible** | Parquet data files | MinIO |
+| **DuckDB** | Columnar SQL engine | Embedded via `duckdbex` NIF |
+
+Start everything with:
+
+```sh
+docker compose up -d
+# Livebook → http://localhost:4000  (password: livebookdemo)
+# MinIO    → http://localhost:9001  (minioadmin / minioadmin)
+# REST API → http://localhost:8181/v1/namespaces
+```
+
+## The Domain: Analytics Events
+
+A high-write analytics pipeline. Events arrive in bursts; each Iceberg snapshot is one `INSERT` statement, so batching rows is essential for throughput.
+
+```elixir
+defmodule Demo.Event do
+  use Ash.Resource,
+    domain: Demo,
+    data_layer: AshIceberg.DataLayer
+
+  iceberg do
+    catalog Demo.Catalog
+    namespace "demo"
+    table "events"
+
+    # Iceberg is append-optimised; UPDATE/DELETE require V2 positional deletes.
+    # This table is intentionally append-only.
+    can_update? false
+    can_destroy? false
+
+    # Partition spec — DuckDB skips entire Parquet files that cannot intersect
+    # the query's time window or user-id bucket range.
+    partition :occurred_at, transform: :hour      # ~1 file per hour of writes
+    partition :user_id,     transform: {:bucket, 16}  # 16 hash buckets on user_id
+  end
+
+  attributes do
+    uuid_primary_key :id
+
+    attribute :user_id,     :integer,                     allow_nil?: false, public?: true
+    attribute :event_type,  :string,                      allow_nil?: false, public?: true
+    attribute :value,       :float,                       default: 0.0,      public?: true
+    attribute :region,      :string,                      default: "us-east-1", public?: true
+    attribute :occurred_at, AshIceberg.Types.TimestampTz, default: &DateTime.utc_now/0, public?: true
+  end
+
+  actions do
+    defaults [:create, :read]
+
+    read :by_user do
+      argument :user_id, :integer, allow_nil?: false
+      filter expr(user_id == ^arg(:user_id))
+    end
+
+    read :by_type do
+      argument :event_type, :string, allow_nil?: false
+      filter expr(event_type == ^arg(:event_type))
+    end
+
+    read :by_region do
+      argument :region, :string, allow_nil?: false
+      filter expr(region == ^arg(:region))
+    end
+
+    read :high_value do
+      argument :threshold, :float, default: 250.0
+      filter expr(value >= ^arg(:threshold))
+    end
+
+    read :in_time_range do
+      argument :from, AshIceberg.Types.TimestampTz, allow_nil?: false
+      argument :to,   AshIceberg.Types.TimestampTz, allow_nil?: false
+      filter expr(occurred_at >= ^arg(:from) and occurred_at <= ^arg(:to))
+    end
+  end
+end
+
+defmodule Demo do
+  use Ash.Domain, validate_config_inclusion?: false
+  resources do
+    resource Demo.Event
+  end
+end
+```
+
+## Table Setup
+
+Create the Iceberg namespace and table once.  Subsequent runs are idempotent.
+
+```elixir
+alias AshIceberg.Catalog.RestClient
+
+cfg = Demo.Catalog.config()
+
+:ok = RestClient.ensure_namespace(cfg, "demo")
+IO.puts("✓ namespace 'demo'")
+
+schema = %{
+  "type" => "struct", "schema-id" => 0,
+  "identifier-field-ids" => [1],
+  "fields" => [
+    %{"id" => 1, "name" => "id",          "required" => true,  "type" => "string"},
+    %{"id" => 2, "name" => "user_id",     "required" => true,  "type" => "int"},
+    %{"id" => 3, "name" => "event_type",  "required" => true,  "type" => "string"},
+    %{"id" => 4, "name" => "value",       "required" => false, "type" => "double"},
+    %{"id" => 5, "name" => "region",      "required" => false, "type" => "string"},
+    %{"id" => 6, "name" => "occurred_at", "required" => false, "type" => "timestamptz"}
+  ]
+}
+
+partition_spec = %{
+  "spec-id" => 0,
+  "fields" => [
+    %{"field-id" => 1000, "source-id" => 6, "name" => "occurred_at_hour",  "transform" => "hour"},
+    %{"field-id" => 1001, "source-id" => 2, "name" => "user_id_bucket_16", "transform" => "bucket[16]"}
+  ]
+}
+
+case RestClient.create_table(cfg, "demo", "events", schema, partition_spec) do
+  {:ok, _}           -> IO.puts("✓ table 'events' created")
+  {:error, {409, _}} -> IO.puts("✓ table 'events' already exists")
+  {:error, r}        -> raise "create_table failed: #{inspect(r)}"
+end
+
+# Register the table in DuckDB through the attached catalog.
+# Falls back to iceberg_scan() path if the REST ATTACH doesn't support DDL.
+ddl = """
+CREATE TABLE IF NOT EXISTS demo_catalog.demo.events (
+  id VARCHAR, user_id INTEGER, event_type VARCHAR,
+  value DOUBLE, region VARCHAR, occurred_at TIMESTAMPTZ
+)
+"""
+case AshIceberg.Connection.query(Demo.Catalog, ddl) do
+  {:ok, _}    -> IO.puts("✓ DuckDB table reference ready")
+  {:error, r} -> IO.puts("⚠  DuckDB DDL skipped (#{inspect(r)}) — using iceberg_scan()")
+end
+```
+
+## Introspection
+
+All Iceberg configuration is accessible at compile time through `AshIceberg.DataLayer.Info`.
+
+```elixir
+# Catalog, namespace, table
+AshIceberg.DataLayer.Info.catalog(Demo.Event)
+```
+
+```elixir
+AshIceberg.DataLayer.Info.namespace(Demo.Event)
+```
+
+```elixir
+AshIceberg.DataLayer.Info.table(Demo.Event)
+```
+
+```elixir
+# Partition spec defined in the DSL
+AshIceberg.DataLayer.Info.partitions(Demo.Event)
+|> Enum.map(fn p -> "#{p.field} → #{inspect(p.transform)}" end)
+```
+
+```elixir
+# Capability matrix for this data layer
+capabilities = [:read, :create, :update, :destroy, :bulk_create,
+                :sort, :filter, :limit, :offset, :select,
+                :aggregate, :distinct, :transact, :upsert]
+
+Kino.DataTable.new(
+  Enum.map(capabilities, fn cap ->
+    %{capability: cap, supported: AshIceberg.DataLayer.can?(Demo.Event, cap)}
+  end)
+)
+```
+
+## The Write Path
+
+### Single create
+
+One `Ash.create!` → one DuckDB `INSERT` → one Iceberg snapshot (one S3 PUT + catalog commit).
+
+```elixir
+defmodule Demo.Gen do
+  @types   ~w[view click purchase share bookmark]
+  @regions ~w[us-east-1 us-west-2 eu-west-1 ap-southeast-1]
+
+  def event do
+    %{
+      user_id:     :rand.uniform(100_000),
+      event_type:  Enum.random(@types),
+      value:       Float.round(:rand.uniform() * 500, 2),
+      region:      Enum.random(@regions),
+      occurred_at: DateTime.utc_now()
+    }
+  end
+
+  def events(n), do: Enum.map(1..n, fn _ -> event() end)
+end
+
+t0 = System.monotonic_time(:millisecond)
+
+event =
+  Demo.Event
+  |> Ash.Changeset.for_create(:create, Demo.Gen.event())
+  |> Ash.create!(domain: Demo)
+
+elapsed = System.monotonic_time(:millisecond) - t0
+IO.puts("Created in #{elapsed}ms: #{String.slice(event.id, 0, 8)}… user=#{event.user_id} type=#{event.event_type} value=#{event.value}")
+```
+
+### Bulk create — one snapshot per batch
+
+Iceberg creates **one snapshot per INSERT statement**, regardless of how many rows it contains. Batching is therefore far more efficient: 5 000 rows in one INSERT costs roughly the same as 1 row in one INSERT.
+
+```elixir
+t0 = System.monotonic_time(:millisecond)
+
+Ash.bulk_create!(Demo.Gen.events(500), Demo.Event, :create,
+  domain: Demo, return_records?: false)
+
+elapsed = System.monotonic_time(:millisecond) - t0
+IO.puts("bulk_create 500 rows → #{elapsed}ms  (#{Float.round(500 / elapsed * 1000, 0)} rows/sec)")
+```
+
+```elixir
+# Three more batches so we have several snapshots for time travel
+Enum.each([500, 500, 500], fn n ->
+  t0 = System.monotonic_time(:millisecond)
+  Ash.bulk_create!(Demo.Gen.events(n), Demo.Event, :create,
+    domain: Demo, return_records?: false)
+  elapsed = System.monotonic_time(:millisecond) - t0
+  IO.puts("  batch #{n} rows → #{elapsed}ms")
+end)
+
+{:ok, snaps} = AshIceberg.Snapshots.list(Demo.Event)
+IO.puts("\n#{length(snaps)} Iceberg snapshots now committed")
+```
+
+### What the SQL looks like
+
+```elixir
+# Inspect the generated INSERT SQL for a single row
+alias AshIceberg.{Query, QueryBuilder}
+q = %Query{catalog: Demo.Catalog, namespace: "demo", table: "events"}
+attrs = %{id: "abc-123", user_id: 42, event_type: "click", value: 9.99, occurred_at: DateTime.utc_now()}
+{:ok, sql} = QueryBuilder.build_insert(q, attrs)
+IO.puts(sql)
+```
+
+```elixir
+# And the generated SELECT with a filter
+alias AshIceberg.Filter
+
+filter_expr = %Ash.Query.BooleanExpression{
+  op: :and,
+  left: %Ash.Query.Operator.Eq{
+    left: %Ash.Query.Ref{attribute: %{name: :region}, relationship_path: [], resource: nil},
+    right: "us-east-1"
+  },
+  right: %Ash.Query.Operator.GreaterThan{
+    left: %Ash.Query.Ref{attribute: %{name: :value}, relationship_path: [], resource: nil},
+    right: 250.0
+  }
+}
+
+{:ok, sql} = QueryBuilder.build_select(%Query{
+  catalog: Demo.Catalog,
+  namespace: "demo", table: "events",
+  filter: %Ash.Filter{expression: filter_expr},
+  sort: [value: :desc],
+  limit: 10
+})
+
+IO.puts(sql)
+```
+
+## The Read Path
+
+### Basic read
+
+```elixir
+all = Ash.read!(Demo.Event, domain: Demo)
+IO.puts("#{length(all)} total events")
+hd(all)
+```
+
+### Equality filter
+
+```elixir
+sample_user = hd(all).user_id
+
+Demo.Event
+|> Ash.Query.for_read(:by_user, %{user_id: sample_user})
+|> Ash.read!(domain: Demo)
+|> then(fn rows ->
+  IO.puts("Events for user #{sample_user}: #{length(rows)}")
+  hd(rows)
+end)
+```
+
+```elixir
+# Multi-condition AND filter
+Demo.Event
+|> Ash.Query.filter(event_type == "click" and value > 250.0)
+|> Ash.read!(domain: Demo)
+|> then(&IO.puts("high-value clicks: #{length(&1)}"))
+```
+
+### String operators — `contains`, `string_starts_with`, `string_ends_with`
+
+These compile to `LIKE` predicates pushed into DuckDB.
+
+```elixir
+Demo.Event |> Ash.Query.filter(string_starts_with(event_type, "pur")) |> Ash.read!(domain: Demo) |> length() |> then(&IO.puts("starts_with 'pur' → #{&1}"))
+Demo.Event |> Ash.Query.filter(string_ends_with(event_type, "ck"))   |> Ash.read!(domain: Demo) |> length() |> then(&IO.puts("ends_with 'ck'   → #{&1}"))
+Demo.Event |> Ash.Query.filter(contains(event_type, "a"))            |> Ash.read!(domain: Demo) |> length() |> then(&IO.puts("contains 'a'      → #{&1}"))
+```
+
+### IN / NOT NULL
+
+```elixir
+Demo.Event
+|> Ash.Query.filter(event_type in ["click", "purchase"])
+|> Ash.read!(domain: Demo)
+|> length()
+|> then(&IO.puts("IN ['click','purchase'] → #{&1}"))
+```
+
+### Sort, limit, offset
+
+```elixir
+# Top-10 highest-value events
+Demo.Event
+|> Ash.Query.sort(value: :desc)
+|> Ash.Query.limit(10)
+|> Ash.Query.select([:user_id, :event_type, :value])
+|> Ash.read!(domain: Demo)
+|> Kino.DataTable.new()
+```
+
+```elixir
+# Offset pagination
+page2 =
+  Demo.Event
+  |> Ash.Query.sort(:occurred_at)
+  |> Ash.Query.limit(10)
+  |> Ash.Query.offset(10)
+  |> Ash.read!(domain: Demo)
+
+IO.puts("Page 2 (rows 11–20): #{length(page2)} events")
+```
+
+### Aggregates — pushed into DuckDB `COUNT/SUM/AVG/MIN/MAX`
+
+```elixir
+[row | _] =
+  Demo.Event
+  |> Ash.Query.aggregate(:n, :count, :id)
+  |> Ash.read!(domain: Demo)
+
+IO.puts("COUNT(*) = #{row.aggregates.n}")
+```
+
+```elixir
+[row | _] =
+  Demo.Event
+  |> Ash.Query.aggregate(:total, :sum,   :value)
+  |> Ash.Query.aggregate(:avg,   :avg,   :value)
+  |> Ash.Query.aggregate(:hi,    :max,   :value)
+  |> Ash.Query.aggregate(:lo,    :min,   :value)
+  |> Ash.read!(domain: Demo)
+
+Kino.DataTable.new([%{
+  count:    row.aggregates.n || "—",
+  sum:      Float.round(row.aggregates.total || 0.0, 2),
+  avg:      Float.round(row.aggregates.avg   || 0.0, 4),
+  max:      row.aggregates.hi,
+  min:      row.aggregates.lo
+}])
+```
+
+## Time Travel ✨
+
+Every write commits an immutable **Iceberg snapshot**. Pass a `snapshot_id` or `as_of` timestamp in the Ash query context to read the table as it existed at any prior point in time — no extra tables, no ETL, no copying data.
+
+### List the snapshot history
+
+```elixir
+{:ok, snaps} = AshIceberg.Snapshots.list(Demo.Event)
+
+Kino.DataTable.new(
+  Enum.map(snaps, fn s ->
+    %{
+      snapshot_id: s["snapshot-id"],
+      timestamp:   to_string(s["timestamp"]),
+      operation:   s["operation"]
+    }
+  end)
+)
+```
+
+### Read at a specific snapshot
+
+```elixir
+[first_snap | _] = snaps
+sid = first_snap["snapshot-id"]
+
+past =
+  Demo.Event
+  |> Ash.Query.set_context(%{ash_iceberg: %{snapshot_id: sid}})
+  |> Ash.read!(domain: Demo)
+
+current = Ash.read!(Demo.Event, domain: Demo)
+
+IO.puts("""
+Snapshot #{sid}  → #{length(past)} rows
+Current         → #{length(current)} rows
+Added since:     #{length(current) - length(past)} rows
+""")
+```
+
+### Read as of a wall-clock time
+
+```elixir
+# What did the table look like 30 seconds ago?
+as_of  = DateTime.add(DateTime.utc_now(), -30, :second)
+past30 =
+  Demo.Event
+  |> Ash.Query.set_context(%{ash_iceberg: %{as_of: as_of}})
+  |> Ash.read!(domain: Demo)
+
+IO.puts("Events 30 seconds ago: #{length(past30)}")
+```
+
+### What iceberg_scan() generates
+
+```elixir
+# Time travel compiles to an extra argument on iceberg_scan():
+#   iceberg_scan('/path', snapshot_id = 1234567890)
+#   iceberg_scan('/path', snapshot_timestamp_ms = 1700000000000)
+
+q_with_snap = %Query{
+  catalog: nil, namespace: "demo", table: "events",
+  warehouse: "s3://warehouse",
+  snapshot_id: 1_234_567_890
+}
+{:ok, sql} = QueryBuilder.build_select(q_with_snap)
+IO.puts("snapshot_id: " <> sql)
+
+q_with_ts = %Query{q_with_snap | snapshot_id: nil, as_of: ~U[2025-01-01 00:00:00Z]}
+{:ok, sql} = QueryBuilder.build_select(q_with_ts)
+IO.puts("as_of:       " <> sql)
+```
+
+## Snapshot Introspection
+
+```elixir
+# Current (latest) snapshot
+{:ok, current_snap} = AshIceberg.Snapshots.current(Demo.Event)
+
+case current_snap do
+  nil  -> IO.puts("No snapshots yet")
+  snap ->
+    IO.puts("""
+    Current snapshot:
+      id:        #{snap["snapshot-id"]}
+      timestamp: #{snap["timestamp"]}
+      operation: #{snap["operation"]}
+    """)
+end
+```
+
+```elixir
+# Previous snapshot — for incremental read pipelines
+latest_id = List.last(snaps)["snapshot-id"]
+{:ok, prev} = AshIceberg.Snapshots.previous(Demo.Event, latest_id)
+
+case prev do
+  nil  -> IO.puts("No previous snapshot")
+  snap -> IO.puts("Previous: id=#{snap["snapshot-id"]} at #{snap["timestamp"]}")
+end
+```
+
+## Schema Evolution
+
+Iceberg supports **non-destructive** schema changes: add optional columns without rewriting Parquet files. Old files are still readable; new files include the extra column.
+
+```elixir
+result = RestClient.evolve_schema(cfg, "demo", "events", [
+  %{
+    "action"   => "add-column",
+    "parent"   => nil,
+    "name"     => "campaign_id",
+    "type"     => "string",
+    "doc"      => "Marketing campaign that triggered this event",
+    "required" => false
+  }
+])
+
+case result do
+  {:ok, _}    -> IO.puts("✓ column 'campaign_id' added — existing Parquet files unchanged")
+  {:error, r} -> IO.puts("Catalog note: #{inspect(r)}")
+end
+```
+
+```elixir
+# Table properties (write behaviour, compression, etc.)
+result = RestClient.set_table_properties(cfg, "demo", "events", %{
+  "write.target-file-size-bytes" => "134217728",
+  "write.parquet.compression-codec" => "zstd"
+})
+
+case result do
+  {:ok, _}    -> IO.puts("✓ table properties updated")
+  {:error, r} -> IO.puts("Note: #{inspect(r)}")
+end
+```
+
+## Partition Spec
+
+The `partition` entity in the `iceberg` DSL block declares how Iceberg should organise files. The REST Catalog enforces the spec at commit time; DuckDB's scan reads the partition metadata to skip files that cannot contain matching rows.
+
+```elixir
+# Show the full set of supported transforms
+transforms = [
+  {:identity, "exact-value directories — good for low-cardinality categorical columns"},
+  {:year,     "year(timestamp) — 1 directory per calendar year"},
+  {:month,    "month(timestamp) — 1 directory per calendar month"},
+  {:day,      "day(timestamp) — 1 directory per calendar day"},
+  {:hour,     "hour(timestamp) — 1 directory per clock hour (used by this resource)"},
+  {{:bucket, 16}, "bucket[16] — hash user_id into 16 buckets (used by this resource)"},
+  {{:truncate, 8}, "truncate[8] — first 8 chars of a string column"},
+]
+
+Kino.DataTable.new(
+  Enum.map(transforms, fn {transform, description} ->
+    %{transform: inspect(transform), description: description}
+  end)
+)
+```
+
+```elixir
+# Inspect this resource's partition spec
+AshIceberg.DataLayer.Info.partitions(Demo.Event)
+|> Enum.map(&AshIceberg.Partition.to_iceberg_spec/1)
+|> Kino.DataTable.new()
+```
+
+## Mix Tasks
+
+From a terminal in the project root:
+
+```
+# Generate a catalog module + config stanza
+mix ash_iceberg.gen.catalog MyApp.IcebergCatalog --type rest
+
+# Create Iceberg tables from resource definitions
+# (reads the iceberg DSL, maps Ash types to Iceberg types, calls REST API)
+mix ash_iceberg.create_table MyApp.Events MyApp.Users
+```
+
+## Benchmarks
+
+These benchmarks prove two things about Iceberg performance:
+
+1. **Batching writes is not optional** — every INSERT commits one Iceberg snapshot (one S3 PUT + one catalog commit). Batching amortises that fixed cost across many rows; the per-row cost drops by ~100–1000x.
+
+2. **DuckDB scans Parquet at columnar speeds** — projecting fewer columns, filtering early, and aggregating in DuckDB avoids materialising unnecessary data in Elixir.
+
+```elixir
+IO.puts("── writes: snapshot overhead ────────────────────────────────────────────")
+IO.puts("""
+  Every INSERT commits one snapshot:  S3 PUT + catalog commit ≈ fixed cost.
+  Throughput scales with batch size until you hit CPU/network limits.
+""")
+
+Benchee.run(
+  %{
+    "single create (1 row / snapshot)" => fn ->
+      Demo.Event
+      |> Ash.Changeset.for_create(:create, Demo.Gen.event())
+      |> Ash.create!(domain: Demo)
+    end,
+
+    "bulk_create 100 rows / snapshot" => fn ->
+      Ash.bulk_create!(Demo.Gen.events(100), Demo.Event, :create,
+        domain: Demo, return_records?: false)
+    end,
+
+    "bulk_create 1 000 rows / snapshot" => fn ->
+      Ash.bulk_create!(Demo.Gen.events(1_000), Demo.Event, :create,
+        domain: Demo, return_records?: false)
+    end,
+
+    "bulk_create 5 000 rows / snapshot" => fn ->
+      Ash.bulk_create!(Demo.Gen.events(5_000), Demo.Event, :create,
+        domain: Demo, return_records?: false)
+    end,
+  },
+  warmup: 2,
+  time:   15,
+  memory_time: 2,
+  formatters: [{Benchee.Formatters.Console, extended_statistics: true}],
+  print: [fast_warning: false]
+)
+```
+
+```elixir
+IO.puts("── reads: DuckDB columnar scans ─────────────────────────────────────────")
+n_rows = Ash.read!(Demo.Event, domain: Demo) |> length()
+IO.puts("  #{n_rows} rows in the table\n")
+
+Benchee.run(
+  %{
+    "full scan — all #{n_rows} rows" => fn ->
+      Ash.read!(Demo.Event, domain: Demo)
+    end,
+
+    "filter region='us-east-1' (~25 %)" => fn ->
+      Demo.Event
+      |> Ash.Query.for_read(:by_region, %{region: "us-east-1"})
+      |> Ash.read!(domain: Demo)
+    end,
+
+    "filter value >= 250 (~50 %)" => fn ->
+      Demo.Event
+      |> Ash.Query.for_read(:high_value, %{threshold: 250.0})
+      |> Ash.read!(domain: Demo)
+    end,
+
+    "sort + limit top-10" => fn ->
+      Demo.Event
+      |> Ash.Query.sort(value: :desc)
+      |> Ash.Query.limit(10)
+      |> Ash.read!(domain: Demo)
+    end,
+
+    "COUNT aggregate" => fn ->
+      [row | _] = Demo.Event |> Ash.Query.aggregate(:n, :count, :id) |> Ash.read!(domain: Demo)
+      row.aggregates.n
+    end,
+
+    "2-column projection" => fn ->
+      Demo.Event
+      |> Ash.Query.select([:user_id, :value])
+      |> Ash.read!(domain: Demo)
+    end,
+  },
+  warmup: 3,
+  time:   20,
+  memory_time: 2,
+  formatters: [{Benchee.Formatters.Console, extended_statistics: true}],
+  print: [fast_warning: false]
+)
+```
+
+```elixir
+IO.puts("── time travel: reading past snapshots ──────────────────────────────────")
+IO.puts("""
+  Reading a past snapshot costs the same as reading the current one.
+  DuckDB receives snapshot_id = N in the iceberg_scan() call and selects
+  only the Parquet files that existed at that snapshot.
+""")
+
+{:ok, snaps} = AshIceberg.Snapshots.list(Demo.Event)
+n_snaps = length(snaps)
+
+if n_snaps >= 2 do
+  first_id = hd(snaps)["snapshot-id"]
+  mid_id   = Enum.at(snaps, div(n_snaps, 2))["snapshot-id"]
+
+  Benchee.run(
+    %{
+      "current snapshot (all data)" => fn ->
+        Ash.read!(Demo.Event, domain: Demo)
+      end,
+
+      "mid snapshot (#{div(n_snaps, 2)}/#{n_snaps} batches)" => fn ->
+        Demo.Event
+        |> Ash.Query.set_context(%{ash_iceberg: %{snapshot_id: mid_id}})
+        |> Ash.read!(domain: Demo)
+      end,
+
+      "first snapshot (1 batch)" => fn ->
+        Demo.Event
+        |> Ash.Query.set_context(%{ash_iceberg: %{snapshot_id: first_id}})
+        |> Ash.read!(domain: Demo)
+      end,
+    },
+    warmup: 2,
+    time:   15,
+    memory_time: 0,
+    print: [fast_warning: false]
+  )
+else
+  IO.puts("  run more bulk_create cells first to generate ≥ 2 snapshots")
+end
+```
+
+## Summary
+
+| Capability | How |
+| --- | --- |
+| Append-only writes | `can_update? false`, `can_destroy? false` |
+| Single insert | `Ash.create!` |
+| Batched insert | `Ash.bulk_create!` — one Iceberg snapshot per call |
+| Equality filter | `filter expr(field == value)` |
+| Range filter | `filter expr(field >= lo and field <= hi)` |
+| String filter | `string_starts_with`, `string_ends_with`, `contains` |
+| IN / IS NULL | `filter expr(field in list)` / `expr(is_nil(field))` |
+| Sort | `Ash.Query.sort` |
+| Limit / offset | `Ash.Query.limit` + `.offset` |
+| Column projection | `Ash.Query.select` |
+| Aggregates | `Ash.Query.aggregate` → `COUNT/SUM/AVG/MIN/MAX` |
+| **Time travel by snapshot** | `Ash.Query.set_context(%{ash_iceberg: %{snapshot_id: id}})` |
+| **Time travel by time** | `Ash.Query.set_context(%{ash_iceberg: %{as_of: datetime}})` |
+| Snapshot history | `AshIceberg.Snapshots.list(resource)` |
+| Current snapshot | `AshIceberg.current_snapshot(resource)` |
+| Schema evolution | `RestClient.evolve_schema/4` |
+| Table properties | `RestClient.set_table_properties/4` |
+| Partition spec | `partition :field, transform: :hour` in the `iceberg` DSL |
+| Table creation | `mix ash_iceberg.create_table MyApp.Resource` |
+| Catalog scaffold | `mix ash_iceberg.gen.catalog MyApp.MyCatalog` |
+
+AshIceberg gives you Iceberg's immutable snapshot history, schema evolution, and partition-aware columnar scans — accessible through the standard Ash resource API. Policies, validations, code interfaces, and other Ash extensions all work exactly as they do on any other resource.

@@ -56,7 +56,7 @@ defmodule AshIcebergTest do
 
     test "applies OFFSET without LIMIT using max value" do
       {:ok, sql} = QueryBuilder.build_select(warehouse_query(offset: 5))
-      assert sql =~ "LIMIT 18446744073709551615 OFFSET 5"
+      assert sql =~ "LIMIT 9223372036854775807 OFFSET 5"
     end
 
     test "applies LIMIT and OFFSET together" do

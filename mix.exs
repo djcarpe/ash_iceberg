@@ -45,6 +45,7 @@ defmodule AshIceberg.MixProject do
 
       # Dev / test
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
+      {:benchee, "~> 1.3", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
@@ -71,9 +72,16 @@ defmodule AshIceberg.MixProject do
         Connection: [
           AshIceberg.Connection
         ],
+        Snapshots: [
+          AshIceberg.Snapshots
+        ],
         Types: [
           AshIceberg.Types.TimestampTz,
-          AshIceberg.Types.Fixed
+          AshIceberg.Types.Fixed,
+          AshIceberg.Types.Decimal
+        ],
+        DSL: [
+          AshIceberg.Partition
         ]
       ]
     ]

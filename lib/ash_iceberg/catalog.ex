@@ -80,18 +80,66 @@ defmodule AshIceberg.Catalog do
       end
 
       def child_spec(opts) do
-        %{
-          id: __MODULE__,
-          start:
-            {AshIceberg.Connection, :start_link,
-             [[catalog: __MODULE__, name: __MODULE__] ++ opts]},
-          type: :worker,
-          restart: :permanent
-        }
+        pool_size = config()[:pool_size] || 1
+
+        if pool_size == 1 do
+          %{
+            id: __MODULE__,
+            start:
+              {AshIceberg.Connection, :start_link,
+               [[catalog: __MODULE__, name: __MODULE__] ++ opts]},
+            type: :worker,
+            restart: :permanent
+          }
+        else
+          children =
+            for i <- 0..(pool_size - 1) do
+              name = AshIceberg.Catalog.worker_name(__MODULE__, i)
+              %{
+                id: name,
+                start:
+                  {AshIceberg.Connection, :start_link,
+                   [[catalog: __MODULE__, name: name] ++ opts]},
+                type: :worker,
+                restart: :permanent
+              }
+            end
+
+          %{
+            id: __MODULE__,
+            start: {Supervisor, :start_link, [children, [strategy: :one_for_one]]},
+            type: :supervisor
+          }
+        end
+      end
+
+      @doc "Execute a SQL string against this catalog's DuckDB connection (pool-aware)."
+      def query(sql) do
+        worker = AshIceberg.Catalog.pick_worker(__MODULE__)
+        AshIceberg.Connection.query(worker, sql)
       end
 
       def start_link(opts \\ []) do
-        AshIceberg.Connection.start_link([catalog: __MODULE__, name: __MODULE__] ++ opts)
+        pool_size = config()[:pool_size] || 1
+
+        if pool_size == 1 do
+          AshIceberg.Connection.start_link([catalog: __MODULE__, name: __MODULE__] ++ opts)
+        else
+          children =
+            for i <- 0..(pool_size - 1) do
+              name = AshIceberg.Catalog.worker_name(__MODULE__, i)
+              %{
+                id: name,
+                start:
+                  {AshIceberg.Connection, :start_link,
+                   [[catalog: __MODULE__, name: name] ++ opts]},
+                type: :worker,
+                restart: :permanent
+              }
+            end
+
+          Supervisor.start_link(children, strategy: :one_for_one)
+        end
       end
 
       defoverridable config: 0, table_location: 2
@@ -104,11 +152,41 @@ defmodule AshIceberg.Catalog do
   Used when building qualified table references (`catalog.namespace.table`).
   """
   def catalog_name(catalog_module) when is_atom(catalog_module) do
-    catalog_module
-    |> Module.split()
-    |> List.last()
-    |> Macro.underscore()
-    |> String.replace(~r/[^a-z0-9_]/, "_")
+    # Prefer the catalog_name set in the catalog's config; fall back to
+    # snake_casing the last segment of the module name.
+    with true <- function_exported?(catalog_module, :config, 0),
+         %{catalog_name: name} when is_binary(name) <- catalog_module.config() do
+      name
+    else
+      _ ->
+        catalog_module
+        |> Module.split()
+        |> List.last()
+        |> Macro.underscore()
+        |> String.replace(~r/[^a-z0-9_]/, "_")
+    end
+  end
+
+  @doc "Returns the registered name for pool worker `index` of `catalog_module`."
+  def worker_name(catalog_module, index) when is_integer(index) do
+    :"#{catalog_module}_#{index}"
+  end
+
+  @doc """
+  Returns the atom name of the appropriate pool worker for the calling process.
+
+  When `pool_size` is 1, returns the catalog module atom itself. For larger
+  pools, picks a worker via process-hash affinity so the same caller always
+  hits the same DuckDB connection (improves cache locality).
+  """
+  def pick_worker(catalog_module) do
+    pool_size = catalog_module.config()[:pool_size] || 1
+
+    if pool_size == 1 do
+      catalog_module
+    else
+      worker_name(catalog_module, rem(:erlang.phash2(self()), pool_size))
+    end
   end
 
   @doc false

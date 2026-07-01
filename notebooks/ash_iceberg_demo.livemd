@@ -1,0 +1,548 @@
+# AshIceberg — Interactive Demo
+
+```elixir
+# ── Setup ──────────────────────────────────────────────────────────────────────
+# Before running this notebook, start the infrastructure:
+#
+#   docker compose up -d minio minio-setup iceberg-rest
+#
+# The notebook connects directly to the running services via environment vars.
+# If you're running Livebook outside Docker, the defaults below work with the
+# docker-compose.yml in the repo root.
+
+Mix.install([
+  {:ash_iceberg, path: Path.expand("../", __DIR__)},
+  {:ash, "~> 3.0"},
+  {:req, "~> 0.5"},
+  {:jason, "~> 1.4"},
+  {:kino, "~> 0.14"}
+])
+```
+
+## 1 · Catalog Configuration
+
+An `AshIceberg.Catalog` module holds the connection settings for one Iceberg
+catalog backend and starts a `DuckDB` GenServer on your behalf.
+
+```elixir
+defmodule Notebook.Catalog do
+  use AshIceberg.Catalog, otp_app: :notebook
+
+  @impl AshIceberg.Catalog
+  def config do
+    %{
+      type: :rest,
+      catalog_name: "notebook_catalog",
+      uri: System.get_env("ICEBERG_REST_URI", "http://localhost:8181"),
+      warehouse: System.get_env("S3_WAREHOUSE", "s3://warehouse/"),
+      aws_region: System.get_env("S3_REGION", "us-east-1"),
+      aws_access_key_id: System.get_env("S3_ACCESS_KEY", "minioadmin"),
+      aws_secret_access_key: System.get_env("S3_SECRET_KEY", "minioadmin"),
+      s3_endpoint: System.get_env("S3_ENDPOINT", "http://localhost:9000"),
+      s3_url_style: "path",
+      s3_use_ssl: false
+    }
+  end
+end
+
+# Start the catalog GenServer (DuckDB + iceberg extension + catalog ATTACH)
+{:ok, _pid} = Notebook.Catalog.start_link()
+IO.puts("✓ Catalog started")
+```
+
+## 2 · Domain and Resource Definitions
+
+Define an Ash Domain and an Ash Resource backed by Iceberg.
+
+```elixir
+defmodule Notebook.Domain do
+  use Ash.Domain, validate_config_inclusion?: false
+  resources do
+    resource Notebook.Event
+  end
+end
+
+defmodule Notebook.Event do
+  use Ash.Resource,
+    domain: Notebook.Domain,
+    data_layer: AshIceberg.DataLayer
+
+  iceberg do
+    catalog Notebook.Catalog
+    namespace "notebook"
+    table "events"
+    can_update? false
+    can_destroy? false
+
+    # Partition by hour — DuckDB skips files outside the queried time window
+    partition :occurred_at, transform: :hour
+    # 8 buckets on user_id to avoid hot-spotting high-cardinality writes
+    partition :user_id, transform: {:bucket, 8}
+  end
+
+  attributes do
+    uuid_primary_key :id
+
+    attribute :user_id, :integer, allow_nil?: false
+    attribute :event_type, :string, allow_nil?: false
+    attribute :value, :float, default: 0.0
+    attribute :occurred_at, AshIceberg.Types.TimestampTz, default: &DateTime.utc_now/0
+    attribute :metadata, :map, default: %{}
+  end
+
+  actions do
+    defaults [:create, :read]
+
+    read :by_user do
+      argument :user_id, :integer, allow_nil?: false
+      filter expr(user_id == ^arg(:user_id))
+    end
+
+    read :by_type do
+      argument :event_type, :string, allow_nil?: false
+      filter expr(event_type == ^arg(:event_type))
+    end
+
+    read :in_time_range do
+      argument :from, AshIceberg.Types.TimestampTz, allow_nil?: false
+      argument :to, AshIceberg.Types.TimestampTz, allow_nil?: false
+      filter expr(occurred_at >= ^arg(:from) and occurred_at <= ^arg(:to))
+    end
+
+    read :by_type_prefix do
+      argument :prefix, :string, allow_nil?: false
+      filter expr(string_starts_with(event_type, ^arg(:prefix)))
+    end
+  end
+end
+
+IO.puts("✓ Domain and resource defined")
+```
+
+## 3 · Table Setup (REST Catalog)
+
+Create the Iceberg namespace and table if they don't already exist.
+
+```elixir
+alias AshIceberg.Catalog.RestClient
+
+cfg = Notebook.Catalog.config()
+
+# Namespace
+:ok = RestClient.ensure_namespace(cfg, "notebook")
+IO.puts("✓ namespace 'notebook' ready")
+
+# Table schema
+schema = %{
+  "type" => "struct",
+  "schema-id" => 0,
+  "identifier-field-ids" => [1],
+  "fields" => [
+    %{"id" => 1, "name" => "id", "required" => true, "type" => "string"},
+    %{"id" => 2, "name" => "user_id", "required" => true, "type" => "int"},
+    %{"id" => 3, "name" => "event_type", "required" => true, "type" => "string"},
+    %{"id" => 4, "name" => "value", "required" => false, "type" => "double"},
+    %{"id" => 5, "name" => "occurred_at", "required" => false, "type" => "timestamptz"},
+    %{"id" => 6, "name" => "metadata", "required" => false, "type" => "string"}
+  ]
+}
+
+partition_spec = %{
+  "spec-id" => 0,
+  "fields" => [
+    %{"field-id" => 1000, "source-id" => 5, "name" => "occurred_at_hour", "transform" => "hour"},
+    %{"field-id" => 1001, "source-id" => 2, "name" => "user_id_bucket_8", "transform" => "bucket[8]"}
+  ]
+}
+
+case RestClient.create_table(cfg, "notebook", "events", schema, partition_spec) do
+  {:ok, _} -> IO.puts("✓ table 'events' created")
+  {:error, {409, _}} -> IO.puts("✓ table 'events' already exists")
+  {:error, reason} -> raise "Failed: #{inspect(reason)}"
+end
+
+# Ensure DuckDB can see the table through the attached catalog
+ddl = """
+CREATE TABLE IF NOT EXISTS notebook_catalog.notebook.events (
+  id          VARCHAR,
+  user_id     INTEGER,
+  event_type  VARCHAR,
+  value       DOUBLE,
+  occurred_at TIMESTAMPTZ,
+  metadata    VARCHAR
+)
+"""
+
+case AshIceberg.Connection.query(Notebook.Catalog, ddl) do
+  {:ok, _} -> IO.puts("✓ DuckDB table reference ready")
+  {:error, reason} -> IO.puts("⚠  DuckDB DDL skipped (#{inspect(reason)}) — will use iceberg_scan()")
+end
+```
+
+## 4 · Creating Records
+
+### Single create
+
+```elixir
+event_types = ~w[view click purchase share bookmark]
+
+def random_attrs do
+  %{
+    user_id: :rand.uniform(1_000),
+    event_type: Enum.random(event_types),
+    value: Float.round(:rand.uniform() * 500, 2),
+    occurred_at: DateTime.utc_now(),
+    metadata: %{"session" => Base.encode16(:crypto.strong_rand_bytes(4))}
+  }
+end
+
+event =
+  Notebook.Event
+  |> Ash.Changeset.for_create(:create, random_attrs())
+  |> Ash.create!(domain: Notebook.Domain)
+
+IO.puts("Created: #{event.id} | user=#{event.user_id} type=#{event.event_type} value=#{event.value}")
+```
+
+### Bulk create (one Iceberg snapshot per batch)
+
+Iceberg commits each `INSERT` as a new *snapshot*.  Batching rows into one
+multi-row INSERT dramatically reduces the number of snapshots and S3 PUTs.
+
+```elixir
+rows = Enum.map(1..200, fn _ -> random_attrs() end)
+
+t0 = System.monotonic_time(:millisecond)
+Ash.bulk_create!(rows, Notebook.Event, :create, domain: Notebook.Domain, return_records?: false)
+elapsed = System.monotonic_time(:millisecond) - t0
+
+IO.puts("Bulk-inserted 200 rows in #{elapsed}ms → #{Float.round(200 / elapsed * 1000, 0)} rows/sec")
+```
+
+```elixir
+# Insert a second batch so we have multiple snapshots for later examples
+rows2 = Enum.map(1..200, fn _ -> random_attrs() end)
+Ash.bulk_create!(rows2, Notebook.Event, :create, domain: Notebook.Domain, return_records?: false)
+IO.puts("Second batch inserted → total ≈ 401 events across 3 snapshots")
+```
+
+## 5 · Reading and Filtering
+
+```elixir
+# Read all
+all = Ash.read!(Notebook.Event, domain: Notebook.Domain)
+IO.puts("Total events: #{length(all)}")
+```
+
+```elixir
+# Filter by user_id — pushed down to DuckDB WHERE clause
+sample_user = hd(all).user_id
+user_events = Notebook.Event
+  |> Ash.Query.for_read(:by_user, %{user_id: sample_user})
+  |> Ash.read!(domain: Notebook.Domain)
+
+IO.puts("Events for user #{sample_user}: #{length(user_events)}")
+```
+
+```elixir
+# Filter by event type
+clicks = Notebook.Event
+  |> Ash.Query.for_read(:by_type, %{event_type: "click"})
+  |> Ash.read!(domain: Notebook.Domain)
+
+IO.puts("Click events: #{length(clicks)}")
+```
+
+```elixir
+# Prefix filter (string_starts_with → LIKE 'prefix%')
+purchase_like = Notebook.Event
+  |> Ash.Query.for_read(:by_type_prefix, %{prefix: "pur"})
+  |> Ash.read!(domain: Notebook.Domain)
+
+IO.puts("Events starting with 'pur': #{length(purchase_like)}")
+```
+
+```elixir
+# Time-range filter — Iceberg's hour partition spec means DuckDB can skip
+# files that do not intersect the window entirely.
+from = DateTime.add(DateTime.utc_now(), -3600, :second)  # last hour
+to   = DateTime.utc_now()
+
+recent = Notebook.Event
+  |> Ash.Query.for_read(:in_time_range, %{from: from, to: to})
+  |> Ash.read!(domain: Notebook.Domain)
+
+IO.puts("Events in last hour: #{length(recent)}")
+```
+
+## 6 · Sorting, Pagination, and Select
+
+```elixir
+# Top 5 highest-value events
+top5 = Notebook.Event
+  |> Ash.Query.sort(value: :desc)
+  |> Ash.Query.limit(5)
+  |> Ash.Query.select([:user_id, :event_type, :value])
+  |> Ash.read!(domain: Notebook.Domain)
+
+Enum.each(top5, fn e ->
+  IO.puts("  user=#{e.user_id} type=#{e.event_type} value=#{e.value}")
+end)
+```
+
+```elixir
+# Offset-based pagination
+page2 = Notebook.Event
+  |> Ash.Query.sort(:occurred_at)
+  |> Ash.Query.limit(10)
+  |> Ash.Query.offset(10)
+  |> Ash.read!(domain: Notebook.Domain)
+
+IO.puts("Page 2 (rows 11–20): #{length(page2)} events")
+```
+
+## 7 · Aggregates
+
+```elixir
+# Count via aggregate
+count_q = Notebook.Event
+  |> Ash.Query.aggregate(:count_events, :count, :id)
+  |> Ash.read!(domain: Notebook.Domain)
+
+# The aggregate is returned on each row in Ash 3.x; take the first
+total = hd(count_q).aggregates.count_events
+IO.puts("Total events (COUNT): #{total}")
+```
+
+```elixir
+# Sum and average of value
+sum_avg = Notebook.Event
+  |> Ash.Query.aggregate(:total_value, :sum, :value)
+  |> Ash.Query.aggregate(:avg_value, :avg, :value)
+  |> Ash.read!(domain: Notebook.Domain)
+
+first = hd(sum_avg)
+IO.puts("Total value:   #{Float.round(first.aggregates.total_value, 2)}")
+IO.puts("Average value: #{Float.round(first.aggregates.avg_value, 4)}")
+```
+
+## 8 · Time Travel (Iceberg's Killer Feature ✨)
+
+Iceberg stores every write as an immutable *snapshot*.  You can read data
+as it existed at any past snapshot without ETL or a separate audit table.
+
+### List snapshots
+
+```elixir
+{:ok, snapshots} = AshIceberg.snapshots(Notebook.Event)
+
+Kino.DataTable.new(
+  Enum.map(snapshots, fn snap ->
+    %{
+      snapshot_id: snap["snapshot-id"],
+      timestamp: to_string(snap["timestamp"]),
+      operation: snap["operation"]
+    }
+  end)
+)
+```
+
+### Read by snapshot ID
+
+```elixir
+case snapshots do
+  [first_snap | _] ->
+    sid = first_snap["snapshot-id"]
+    IO.puts("Reading as of first snapshot (id=#{sid}) …")
+
+    old_events = Notebook.Event
+      |> Ash.Query.set_context(%{ash_iceberg: %{snapshot_id: sid}})
+      |> Ash.read!(domain: Notebook.Domain)
+
+    IO.puts("Events at first snapshot: #{length(old_events)}")
+    IO.puts("Events now:              #{length(all)}")
+    IO.puts("Rows added since:        #{length(all) - length(old_events)}")
+
+  [] ->
+    IO.puts("No snapshots yet — run some creates first!")
+end
+```
+
+### Read as of a wall-clock time
+
+```elixir
+# Read data from 30 seconds ago
+as_of = DateTime.add(DateTime.utc_now(), -30, :second)
+
+past_events = Notebook.Event
+  |> Ash.Query.set_context(%{ash_iceberg: %{as_of: as_of}})
+  |> Ash.read!(domain: Notebook.Domain)
+
+IO.puts("Events 30 seconds ago: #{length(past_events)}")
+```
+
+## 9 · Snapshot Introspection
+
+```elixir
+# Current (latest) snapshot
+{:ok, current} = AshIceberg.current_snapshot(Notebook.Event)
+
+case current do
+  nil ->
+    IO.puts("No snapshots yet.")
+
+  snap ->
+    IO.puts("""
+    Current snapshot:
+      id:        #{snap["snapshot-id"]}
+      timestamp: #{snap["timestamp"]}
+      operation: #{snap["operation"]}
+    """)
+end
+```
+
+```elixir
+# Previous snapshot (useful for incremental reads)
+{:ok, snapshots} = AshIceberg.snapshots(Notebook.Event)
+
+if length(snapshots) >= 2 do
+  latest_id = List.last(snapshots)["snapshot-id"]
+  {:ok, prev} = AshIceberg.Snapshots.previous(Notebook.Event, latest_id)
+  IO.puts("Snapshot before current: id=#{prev["snapshot-id"]} at #{prev["timestamp"]}")
+else
+  IO.puts("Only one snapshot exists so far.")
+end
+```
+
+## 10 · Schema Evolution (via REST Catalog)
+
+Iceberg supports **non-breaking** schema changes — you can add optional
+columns without rewriting existing Parquet files.
+
+```elixir
+alias AshIceberg.Catalog.RestClient
+
+# Add an optional column to the events table
+result = RestClient.evolve_schema(cfg, "notebook", "events", [
+  %{
+    "action" => "add-column",
+    "parent" => nil,
+    "name" => "referrer",
+    "type" => "string",
+    "doc" => "HTTP referrer URL",
+    "required" => false
+  }
+])
+
+case result do
+  {:ok, _} ->
+    IO.puts("✓ Column 'referrer' added — existing files are unaffected.")
+
+  {:error, reason} ->
+    IO.puts("Schema evolution not supported by this catalog: #{inspect(reason)}")
+end
+```
+
+## 11 · Table Properties
+
+```elixir
+# Set Iceberg write properties
+result = RestClient.set_table_properties(cfg, "notebook", "events", %{
+  "write.target-file-size-bytes" => "134217728",
+  "write.parquet.compression-codec" => "zstd"
+})
+
+case result do
+  {:ok, _} -> IO.puts("✓ Table properties updated")
+  {:error, reason} -> IO.puts("Note: #{inspect(reason)}")
+end
+```
+
+## 12 · Generating a Catalog Module (Mix Task)
+
+From a terminal in the project root:
+
+```sh
+# Generate a catalog module boilerplate
+mix ash_iceberg.gen.catalog MyApp.IcebergCatalog --type rest
+
+# Create Iceberg tables from resource definitions
+mix ash_iceberg.create_table MyApp.Events MyApp.Users
+```
+
+The `create_table` task reads each resource's `iceberg` DSL block (including
+`partition` specs) and calls the REST catalog API to create namespace + table.
+
+## 13 · Benchmarks
+
+```elixir
+# Quick throughput comparison: single vs batched writes
+warmup_fn = fn n ->
+  rows = Enum.map(1..n, fn _ -> random_attrs() end)
+  Ash.bulk_create!(rows, Notebook.Event, :create, domain: Notebook.Domain, return_records?: false)
+end
+
+# Warm up DuckDB
+warmup_fn.(10)
+
+results =
+  for {label, n} <- [{"single_create", 1}, {"bulk_100", 100}, {"bulk_1000", 1000}] do
+    rows = Enum.map(1..n, fn _ -> random_attrs() end)
+
+    t0 = System.monotonic_time(:microsecond)
+
+    if n == 1 do
+      Notebook.Event
+      |> Ash.Changeset.for_create(:create, hd(rows))
+      |> Ash.create!(domain: Notebook.Domain)
+    else
+      Ash.bulk_create!(rows, Notebook.Event, :create, domain: Notebook.Domain, return_records?: false)
+    end
+
+    elapsed_us = System.monotonic_time(:microsecond) - t0
+    elapsed_ms = elapsed_us / 1_000
+
+    %{
+      scenario: label,
+      rows: n,
+      elapsed_ms: Float.round(elapsed_ms, 1),
+      rows_per_sec: Float.round(n / elapsed_ms * 1_000, 0)
+    }
+  end
+
+Kino.DataTable.new(results)
+```
+
+```elixir
+# Read benchmark
+t0 = System.monotonic_time(:millisecond)
+all = Ash.read!(Notebook.Event, domain: Notebook.Domain)
+read_ms = System.monotonic_time(:millisecond) - t0
+
+IO.puts("""
+Read benchmark:
+  Rows returned: #{length(all)}
+  Time:          #{read_ms}ms
+  Throughput:    #{Float.round(length(all) / max(read_ms, 1) * 1000, 0)} rows/sec
+""")
+```
+
+---
+
+## Summary
+
+| Feature | How |
+|---------|-----|
+| **Basic CRUD** | `Ash.create!`, `Ash.read!`, `Ash.bulk_create!` |
+| **Filtering** | `Ash.Query.filter`, `expr(...)`, named read actions |
+| **Sorting / Pagination** | `Ash.Query.sort`, `.limit`, `.offset` |
+| **String filters** | `contains`, `string_starts_with`, `string_ends_with` in filter expressions |
+| **Aggregates** | `Ash.Query.aggregate` → `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
+| **Time travel** | `Ash.Query.set_context(%{ash_iceberg: %{snapshot_id: id}})` |
+| **Wall-clock travel** | `Ash.Query.set_context(%{ash_iceberg: %{as_of: datetime}})` |
+| **Snapshot list** | `AshIceberg.snapshots(resource)` |
+| **Schema evolution** | `RestClient.evolve_schema/4` |
+| **Table properties** | `RestClient.set_table_properties/4` |
+| **Partition spec** | `partition :field, transform: :hour` in the `iceberg` DSL block |
+| **Table creation** | `mix ash_iceberg.create_table MyApp.Resource` |
+| **Catalog scaffold** | `mix ash_iceberg.gen.catalog MyApp.MyCatalog` |

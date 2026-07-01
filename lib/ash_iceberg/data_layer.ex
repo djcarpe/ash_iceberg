@@ -67,6 +67,11 @@ defmodule AshIceberg.DataLayer do
   def can?(_resource, :distinct), do: true
   def can?(_resource, :composite_primary_key), do: true
   def can?(_resource, :expression_calculation), do: true
+  def can?(_resource, :nested_expressions), do: true
+  def can?(_resource, {:filter_expr, _}), do: true
+  def can?(_resource, {:sort, _}), do: true
+  def can?(_resource, {:aggregate, _}), do: true
+  def can?(_resource, :boolean_filter), do: true
   def can?(_resource, :transact), do: false
   def can?(_resource, :multitenancy), do: false
   def can?(_resource, :upsert), do: false
@@ -79,21 +84,67 @@ defmodule AshIceberg.DataLayer do
 
   @impl Ash.DataLayer
   def resource_to_query(resource, domain) do
+    catalog  = Info.catalog(resource)
+    warehouse = Info.warehouse(resource)
+
+    # If the catalog module is set but its DuckDB ATTACH failed (e.g. the
+    # installed iceberg extension doesn't support REST ATTACH), fall back to
+    # iceberg_scan() with the warehouse path from the catalog's config.
+    # We keep :connection pointing at the catalog's process so that S3
+    # credentials are still in scope for the DuckDB session.
+    {effective_catalog, effective_warehouse, connection} =
+      if catalog != nil and not catalog_attached?(catalog) do
+        fallback_warehouse = warehouse || get_in(catalog.config(), [:warehouse])
+        {nil, fallback_warehouse, catalog}
+      else
+        {catalog, warehouse, nil}
+      end
+
     %Query{
       resource: resource,
       domain: domain,
-      catalog: Info.catalog(resource),
+      catalog: effective_catalog,
       namespace: Info.namespace(resource),
       table: Info.table(resource),
-      warehouse: Info.warehouse(resource)
+      warehouse: effective_warehouse,
+      connection: connection
     }
   end
 
+  defp catalog_attached?(catalog) do
+    worker = pool_worker(catalog)
+
+    case Process.whereis(worker) do
+      nil -> false
+      _pid -> Connection.catalog_attached?(worker)
+    end
+  end
+
   @impl Ash.DataLayer
-  def run_query(%Query{} = query, resource) do
+  def run_query(%Query{aggregates: []} = query, resource) do
     with {:ok, sql} <- QueryBuilder.build_select(query),
          {:ok, rows} <- exec(query, sql) do
       {:ok, rows_to_records(rows, resource)}
+    end
+  end
+
+  def run_query(%Query{aggregates: aggs} = query, resource) do
+    with {:ok, sql} <- QueryBuilder.build_select(query),
+         {:ok, rows} <- exec(query, sql) do
+      # Map aggregate SQL column names → aggregate atoms
+      agg_index = Map.new(aggs, &{to_string(&1.name), &1.name})
+      records = Enum.map(rows, fn row ->
+        {agg_row, attr_row} =
+          Enum.split_with(row, fn {k, _} -> Map.has_key?(agg_index, k) end)
+        agg_map = Map.new(agg_row, fn {k, v} -> {agg_index[k], v} end)
+        base = if attr_row == [] do
+          struct(resource)
+        else
+          attr_row |> Map.new() |> then(&rows_to_records([&1], resource)) |> hd()
+        end
+        %{base | aggregates: agg_map}
+      end)
+      {:ok, records}
     end
   end
 
@@ -133,6 +184,18 @@ defmodule AshIceberg.DataLayer do
   end
 
   @impl Ash.DataLayer
+  def set_context(_resource, query, context) do
+    iceberg_ctx = Map.get(context, :ash_iceberg, %{})
+
+    {:ok,
+     %{
+       query
+       | snapshot_id: Map.get(iceberg_ctx, :snapshot_id, query.snapshot_id),
+         as_of: Map.get(iceberg_ctx, :as_of, query.as_of)
+     }}
+  end
+
+  @impl Ash.DataLayer
   def add_aggregates(query, aggregates, _resource) do
     {:ok, %{query | aggregates: aggregates}}
   end
@@ -149,13 +212,9 @@ defmodule AshIceberg.DataLayer do
     with {:ok, sql} <- QueryBuilder.build_insert(query, attrs),
          {:ok, _rows} <- exec(query, sql) do
       # DuckDB Iceberg INSERT does not return the inserted row; reconstruct
-      # the record from the changeset
-      record =
-        changeset.data
-        |> Map.merge(attrs)
-        |> to_struct(resource)
-
-      {:ok, record}
+      # the record from the changeset. Map.merge on a struct returns a struct,
+      # so we can return it directly without calling struct/2 again.
+      {:ok, Map.merge(changeset.data, attrs)}
     end
   end
 
@@ -189,7 +248,7 @@ defmodule AshIceberg.DataLayer do
   def bulk_create(resource, stream, options) do
     # One INSERT per chunk → one Iceberg snapshot per chunk, which is far
     # more efficient than one snapshot per row.
-    batch_size = options[:batch_size] || 5_000
+    batch_size = options[:batch_size] || 500
     query = resource_to_query(resource, nil)
 
     stream
@@ -201,7 +260,8 @@ defmodule AshIceberg.DataLayer do
            {:ok, _} <- exec(query, sql) do
         records =
           Enum.map(batch, fn cs ->
-            cs.data |> Map.merge(build_attrs(cs, resource)) |> to_struct(resource)
+            record = Map.merge(cs.data, build_attrs(cs, resource))
+            Ash.Actions.Helpers.Bulk.put_metadata(record, cs)
           end)
 
         {:cont, {:ok, acc ++ records}}
@@ -229,11 +289,18 @@ defmodule AshIceberg.DataLayer do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  defp exec(%Query{catalog: nil, connection: conn} = _query, sql) when not is_nil(conn) do
+    # Fallback mode: catalog ATTACH failed; route through the catalog's process
+    # (which has S3 credentials configured) but use iceberg_scan() SQL.
+    case Process.whereis(conn) do
+      nil -> {:error, "Catalog #{inspect(conn)} is not running. Add it to your supervision tree."}
+      _pid -> Connection.query(conn, sql)
+    end
+  end
+
   defp exec(%Query{catalog: nil, warehouse: warehouse} = _query, sql)
        when is_binary(warehouse) do
-    # No per-resource GenServer; use the global connection for warehouse queries.
-    # In a real app, the supervision tree would include a catalog GenServer;
-    # here we open an ad-hoc connection if none is registered.
+    # Pure warehouse mode: look for a global AshIceberg.Connection process.
     server = AshIceberg.Connection
 
     case Process.whereis(server) do
@@ -243,11 +310,15 @@ defmodule AshIceberg.DataLayer do
   end
 
   defp exec(%Query{catalog: catalog} = _query, sql) when not is_nil(catalog) do
-    case Process.whereis(catalog) do
+    worker = pool_worker(catalog)
+
+    case Process.whereis(worker) do
       nil -> {:error, "Catalog #{inspect(catalog)} is not running. Add it to your supervision tree."}
-      _pid -> Connection.query(catalog, sql)
+      _pid -> Connection.query(worker, sql)
     end
   end
+
+  defp pool_worker(catalog), do: AshIceberg.Catalog.pick_worker(catalog)
 
   defp rows_to_records(rows, resource) do
     attributes = Resource.Info.attributes(resource)

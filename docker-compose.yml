@@ -7,15 +7,17 @@ services:
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"   # S3 API
-      - "9001:9001"   # MinIO Console
+      - "9001:9001"   # MinIO Console → http://localhost:9001
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9000' 2>/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
+    volumes:
+      - minio_data:/data
     networks:
       - iceberg
 
@@ -35,7 +37,7 @@ services:
     networks:
       - iceberg
 
-  # ─── Iceberg REST Catalog ────────────────────────────────────────────────────
+  # ─── Iceberg REST Catalog (Tabular) ──────────────────────────────────────────
   iceberg-rest:
     image: tabulario/iceberg-rest:latest
     container_name: iceberg_rest
@@ -43,7 +45,7 @@ services:
       minio-setup:
         condition: service_completed_successfully
     ports:
-      - "8181:8181"
+      - "8181:8181"   # REST Catalog API → http://localhost:8181
     environment:
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
@@ -53,32 +55,47 @@ services:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8181' 2>/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
     networks:
       - iceberg
 
-  # ─── Elixir demo + benchmarks ────────────────────────────────────────────────
-  ash-demo:
-    build:
-      context: .
-      dockerfile: demo/Dockerfile
-    container_name: iceberg_ash_demo
-    depends_on:
-      iceberg-rest:
-        condition: service_healthy
+  # ─── Livebook ────────────────────────────────────────────────────────────────
+  livebook:
+    image: ghcr.io/livebook-dev/livebook:latest
+    restart: unless-stopped
+    ports:
+      - "4000:4000"   # Livebook UI → http://localhost:4000  (password: livebookdemo)
     environment:
+      LIVEBOOK_PORT: "4000"
+      LIVEBOOK_IP: "0.0.0.0"
+      LIVEBOOK_TOKEN_ENABLED: "false"
+      LIVEBOOK_PASSWORD: livebookdemo
+      LIVEBOOK_HOME: /data
+      # Iceberg REST Catalog (internal Docker DNS)
       ICEBERG_REST_URI: http://iceberg-rest:8181
+      # MinIO S3 credentials
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
       S3_REGION: us-east-1
       S3_WAREHOUSE: s3://warehouse/
+    volumes:
+      # ash_iceberg source is mounted at /data so that:
+      #   • {ash_iceberg, path: "/data/"} in Mix.install resolves correctly
+      #   • ash_iceberg_demo.livemd is the Livebook home page
+      - /home/dj/Projects/ash_iceberg:/data
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
     networks:
       - iceberg
 
 networks:
   iceberg:
     driver: bridge
+
+volumes:
+  minio_data:

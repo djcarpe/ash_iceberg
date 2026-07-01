@@ -85,4 +85,66 @@ defmodule AshIceberg do
   """
 
   def version, do: Mix.Project.config()[:version]
+
+  @doc """
+  List Iceberg snapshots for the table backing `resource`.
+
+  Delegates to `AshIceberg.Snapshots.list/1`.
+
+      AshIceberg.snapshots(MyApp.Events)
+      #=> {:ok, [%{"snapshot-id" => 123, "timestamp" => ~U[...], ...}, ...]}
+  """
+  defdelegate snapshots(resource), to: AshIceberg.Snapshots, as: :list
+
+  @doc """
+  Return the current (latest) snapshot for `resource`'s table.
+
+  Delegates to `AshIceberg.Snapshots.current/1`.
+  """
+  defdelegate current_snapshot(resource), to: AshIceberg.Snapshots, as: :current
+
+  @doc """
+  Compact the snapshot history for `resource`'s table.
+
+  Every `bulk_create` or `create` commits one Iceberg snapshot. After many
+  writes, DuckDB must open metadata for hundreds of snapshot files before
+  it can plan a query. Compaction expires old snapshots via the REST catalog,
+  dramatically reducing read latency.
+
+  ## Options
+
+    - `:keep` — number of recent snapshots to retain (default `1`)
+
+  ## Example
+
+      # After bulk loading, compact to a single snapshot for fast reads
+      :ok = AshIceberg.compact_snapshots(MyApp.Events)
+
+      # Keep the 5 most recent snapshots (useful for time-travel auditing)
+      :ok = AshIceberg.compact_snapshots(MyApp.Events, keep: 5)
+
+  Returns `:ok` on success, `{:error, reason}` if the catalog does not
+  support the expire-snapshots endpoint.
+  """
+  @spec compact_snapshots(Ash.Resource.t(), keyword()) :: :ok | {:error, term()}
+  def compact_snapshots(resource, opts \\ []) do
+    keep = opts[:keep] || 1
+    catalog = AshIceberg.DataLayer.Info.catalog(resource)
+    namespace = AshIceberg.DataLayer.Info.namespace(resource)
+    table = AshIceberg.DataLayer.Info.table(resource)
+
+    if catalog == nil do
+      {:error, "compact_snapshots requires a REST catalog (resource has no catalog configured)"}
+    else
+      cfg = catalog.config()
+
+      case AshIceberg.Catalog.RestClient.expire_snapshots(cfg, namespace, table,
+             older_than: DateTime.utc_now(),
+             min_snapshots_to_keep: keep
+           ) do
+        {:ok, _} -> :ok
+        {:error, _} = err -> err
+      end
+    end
+  end
 end
