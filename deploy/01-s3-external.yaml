@@ -1,0 +1,31 @@
+# Selectorless Service fronting the external SeaweedFS S3 endpoint.
+# Both the iceberg and delta demo stacks reach S3 as http://s3.storage:9000;
+# swapping the backing store (e.g. to in-cluster MinIO) only means changing
+# the Endpoints below — no image rebuilds or config changes.
+#
+# Shared by ash_iceberg/deploy and ash_delta/deploy — applying twice is fine.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3
+  namespace: storage
+spec:
+  ports:
+  - port: 9000
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: s3
+  namespace: storage
+subsets:
+- addresses:
+  - ip: 192.168.1.35   # SeaweedFS host
+  ports:
+  - port: 8333         # SeaweedFS S3 API

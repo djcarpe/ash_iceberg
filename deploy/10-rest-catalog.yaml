@@ -1,0 +1,79 @@
+# Iceberg REST Catalog backed by a SQLite file on a PVC (survives restarts)
+# and the shared S3 service for table data.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iceberg-rest-catalog
+  namespace: iceberg
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iceberg-rest
+  namespace: iceberg
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # RWO PVC
+  selector:
+    matchLabels:
+      app: iceberg-rest
+  template:
+    metadata:
+      labels:
+        app: iceberg-rest
+    spec:
+      containers:
+      - name: iceberg-rest
+        image: harbor.home/library/iceberg-rest:tabular
+        ports:
+        - containerPort: 8181
+        env:
+        - name: CATALOG_URI
+          value: jdbc:sqlite:file:/data/catalog.sqlite
+        - name: CATALOG_WAREHOUSE
+          value: s3://lake/iceberg
+        - name: CATALOG_IO__IMPL
+          value: org.apache.iceberg.aws.s3.S3FileIO
+        - name: CATALOG_S3_ENDPOINT
+          value: http://s3.storage:9000
+        - name: CATALOG_S3_PATH__STYLE__ACCESS
+          value: "true"
+        - name: AWS_ACCESS_KEY_ID
+          value: any
+        - name: AWS_SECRET_ACCESS_KEY
+          value: any
+        - name: AWS_REGION
+          value: us-east-1
+        volumeMounts:
+        - name: catalog-db
+          mountPath: /data
+        resources:
+          requests: {cpu: 250m, memory: 512Mi}
+          limits: {memory: 1536Mi}
+        readinessProbe:
+          tcpSocket:
+            port: 8181
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: catalog-db
+        persistentVolumeClaim:
+          claimName: iceberg-rest-catalog
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iceberg-rest
+  namespace: iceberg
+spec:
+  selector:
+    app: iceberg-rest
+  ports:
+  - port: 8181
+    targetPort: 8181

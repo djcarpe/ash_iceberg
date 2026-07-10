@@ -36,7 +36,7 @@ defmodule Demo do
     # (CREATE TABLE IF NOT EXISTS is a no-op when the table is already there)
     ddl = """
     CREATE TABLE IF NOT EXISTS demo_catalog.demo.events (
-      id          VARCHAR,
+      id          BIGINT,
       user_id     INTEGER,
       event_type  VARCHAR,
       value       DOUBLE,
@@ -62,6 +62,8 @@ defmodule Demo do
   @doc "Build params for a random event."
   def random_event do
     %{
+      # Ad-hoc creates start well above the sequential ids used by the seeder.
+      id: 100_000_000_000 + :erlang.unique_integer([:positive, :monotonic]),
       user_id: :rand.uniform(10_000),
       event_type: Enum.random(@event_types),
       value: Float.round(:rand.uniform() * 500, 2),
@@ -114,7 +116,7 @@ defmodule Demo do
       "schema-id" => 0,
       "identifier-field-ids" => [1],
       "fields" => [
-        %{"id" => 1, "name" => "id", "required" => true, "type" => "string"},
+        %{"id" => 1, "name" => "id", "required" => true, "type" => "long"},
         %{"id" => 2, "name" => "user_id", "required" => true, "type" => "int"},
         %{"id" => 3, "name" => "event_type", "required" => true, "type" => "string"},
         %{"id" => 4, "name" => "value", "required" => false, "type" => "double"},

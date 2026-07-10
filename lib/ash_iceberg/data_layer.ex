@@ -64,6 +64,10 @@ defmodule AshIceberg.DataLayer do
   def can?(_resource, :offset), do: true
   def can?(_resource, :select), do: true
   def can?(_resource, :aggregate), do: true
+  def can?(_resource, :aggregate_query), do: true
+  def can?(_resource, {:query_aggregate, kind}) when kind in [:count, :sum, :avg, :min, :max],
+    do: true
+
   def can?(_resource, :distinct), do: true
   def can?(_resource, :composite_primary_key), do: true
   def can?(_resource, :expression_calculation), do: true
@@ -198,6 +202,24 @@ defmodule AshIceberg.DataLayer do
   @impl Ash.DataLayer
   def add_aggregates(query, aggregates, _resource) do
     {:ok, %{query | aggregates: aggregates}}
+  end
+
+  @impl Ash.DataLayer
+  def run_aggregate_query(query, aggregates, _resource) do
+    # Standalone aggregate query (Ash.count/1, countable pagination, ...).
+    # Sort/limit/offset are meaningless for an aggregate-only SELECT and
+    # produce invalid SQL, so they are cleared; the filter is kept.
+    agg_query = %{query | aggregates: aggregates, sort: [], limit: nil, offset: nil, select: []}
+
+    with {:ok, sql} <- QueryBuilder.build_select(agg_query),
+         {:ok, rows} <- exec(agg_query, sql) do
+      row = List.first(rows) || %{}
+
+      {:ok,
+       Map.new(aggregates, fn agg ->
+         {agg.name, Map.get(row, to_string(agg.name), agg.default_value)}
+       end)}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -382,6 +404,31 @@ defmodule AshIceberg.DataLayer do
     case Date.from_iso8601(value) do
       {:ok, d} -> d
       _ -> value
+    end
+  end
+
+  # DuckDB NIF returns TIMESTAMP/TIMESTAMPTZ as {{y, m, d}, {h, min, s, us}}
+  # (or a 3-element time tuple without microseconds) and DATE as {y, m, d}.
+  defp cast({{y, mo, d}, {h, mi, s, us}}, type)
+       when type in [Ash.Type.UtcDatetime, Ash.Type.UtcDatetimeUsec, AshIceberg.Types.TimestampTz] do
+    case NaiveDateTime.new(y, mo, d, h, mi, s, {us, 6}) do
+      {:ok, naive} -> DateTime.from_naive!(naive, "Etc/UTC")
+      _ -> {{y, mo, d}, {h, mi, s, us}}
+    end
+  end
+
+  defp cast({{y, mo, d}, {h, mi, s}}, type)
+       when type in [Ash.Type.UtcDatetime, Ash.Type.UtcDatetimeUsec, AshIceberg.Types.TimestampTz] do
+    case NaiveDateTime.new(y, mo, d, h, mi, s) do
+      {:ok, naive} -> DateTime.from_naive!(naive, "Etc/UTC")
+      _ -> {{y, mo, d}, {h, mi, s}}
+    end
+  end
+
+  defp cast({y, mo, d}, Ash.Type.Date) when is_integer(y) and is_integer(mo) and is_integer(d) do
+    case Date.new(y, mo, d) do
+      {:ok, date} -> date
+      _ -> {y, mo, d}
     end
   end
 

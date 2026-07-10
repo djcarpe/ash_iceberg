@@ -21,6 +21,9 @@ defmodule Demo.MixProject do
   defp deps do
     [
       {:ash_iceberg, path: ".."},
+      {:ash_graphql, "~> 1.4"},
+      {:absinthe_plug, "~> 1.5"},
+      {:bandit, "~> 1.5"},
       {:benchee, "~> 1.3"},
       {:jason, "~> 1.4"}
     ]

@@ -1,0 +1,1 @@
+{application,websock,[{modules,['Elixir.WebSock']},{optional_applications,[]},{applications,[kernel,stdlib,elixir]},{description,[65,32,115,112,101,99,105,102,105,99,97,116,105,111,110,32,102,111,114,32,87,101,98,83,111,99,107,101,116,32,99,111,110,110,101,99,116,105,111,110,115]},{registered,[]},{vsn,[48,46,53,46,51]}]}.
